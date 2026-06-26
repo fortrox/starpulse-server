@@ -55,7 +55,7 @@ function generateChunk() {
     data.push((Math.random() - 0.5) * 2);
   }
 
-  if (Math.random() < 0.03) {
+  if (Math.random() < 0.005) {
     const pos = Math.floor(Math.random() * size);
     const width = Math.floor(Math.random() * 20) + 5;
     for (let i = pos; i < Math.min(pos + width, size); i++) {
