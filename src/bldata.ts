@@ -103,6 +103,8 @@ export async function fetchBLChunk(): Promise<{
 
   if (!url) return null;
 
+  console.log(`[BL] Tentative fetch: ${url.split('/').pop()}`);
+
   try {
     // Récupérer (ou utiliser le cache) du header
     let header = headerCache.get(url);
@@ -113,7 +115,11 @@ export async function fetchBLChunk(): Promise<{
         signal: AbortSignal.timeout(10000),
       });
 
-      if (!res.ok && res.status !== 206) return null;
+      console.log(`[BL] HTTP status: ${res.status}`);
+      if (!res.ok && res.status !== 206) {
+        console.warn(`[BL] Réponse invalide: ${res.status}`);
+        return null;
+      }
 
       const buf = Buffer.from(await res.arrayBuffer());
       header = parseFilterbankHeader(buf) ?? undefined;
