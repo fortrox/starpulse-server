@@ -43,6 +43,15 @@ async function initDB() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS referrals (
+      id          SERIAL PRIMARY KEY,
+      referrer_id TEXT NOT NULL,
+      referred_id TEXT NOT NULL UNIQUE,
+      created_at  BIGINT NOT NULL
+    )
+  `);
+
   console.log('✓ Database ready');
 }
 
@@ -234,6 +243,84 @@ app.get('/stats/user/:userId', async (req, res) => {
       streak: u.streak,
       lastSeen: u.last_seen,
       rank,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /referral — enregistre un parrainage
+app.post('/referral', async (req, res) => {
+  const { userId, referralCode } = req.body as { userId: string; referralCode: string };
+
+  if (!userId || !referralCode) {
+    return res.status(400).json({ error: 'userId and referralCode required' });
+  }
+
+  const code = referralCode.trim().toLowerCase();
+  if (code.length < 6) return res.status(400).json({ error: 'Code invalide' });
+
+  try {
+    // Trouver le parrain via les 8 premiers caractères de son userId
+    const referrerResult = await pool.query(
+      `SELECT user_id FROM contributors WHERE LOWER(LEFT(user_id, 8)) = $1 LIMIT 1`,
+      [code.slice(0, 8)]
+    );
+
+    if (!referrerResult.rows.length) {
+      return res.status(404).json({ error: 'Code de parrainage introuvable' });
+    }
+
+    const referrerId = referrerResult.rows[0].user_id;
+
+    if (referrerId === userId) {
+      return res.status(400).json({ error: 'Tu ne peux pas te parrainer toi-même' });
+    }
+
+    // Vérifier que le filleul n'a pas déjà utilisé un code
+    const alreadyReferred = await pool.query(
+      'SELECT id FROM referrals WHERE referred_id = $1',
+      [userId]
+    );
+    if (alreadyReferred.rows.length) {
+      return res.status(409).json({ error: 'Code déjà utilisé' });
+    }
+
+    // Enregistrer le parrainage
+    await pool.query(
+      'INSERT INTO referrals (referrer_id, referred_id, created_at) VALUES ($1, $2, $3)',
+      [referrerId, userId, Date.now()]
+    );
+
+    const REFERRER_BONUS = 500;
+    const REFERRED_BONUS = 200;
+
+    // Créditer le parrain
+    await pool.query(
+      `INSERT INTO contributors (user_id, points, tokens, anomalies, compute_minutes, streak, last_seen)
+       VALUES ($1, $2, $3, 0, 0, 0, $4)
+       ON CONFLICT (user_id) DO UPDATE SET
+         points = contributors.points + $2,
+         tokens = contributors.tokens + $3,
+         last_seen = $4`,
+      [referrerId, REFERRER_BONUS, REFERRER_BONUS / 10000, Date.now()]
+    );
+
+    // Créditer le filleul
+    await pool.query(
+      `INSERT INTO contributors (user_id, points, tokens, anomalies, compute_minutes, streak, last_seen)
+       VALUES ($1, $2, $3, 0, 0, 0, $4)
+       ON CONFLICT (user_id) DO UPDATE SET
+         points = contributors.points + $2,
+         tokens = contributors.tokens + $3,
+         last_seen = $4`,
+      [userId, REFERRED_BONUS, REFERRED_BONUS / 10000, Date.now()]
+    );
+
+    return res.json({
+      success: true,
+      referrerBonus: REFERRER_BONUS,
+      referredBonus: REFERRED_BONUS,
     });
   } catch (err) {
     return res.status(500).json({ error: String(err) });
