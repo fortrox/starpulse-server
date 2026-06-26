@@ -134,9 +134,9 @@ export async function fetchBLChunk(): Promise<{
     }
 
     // Calculer l'offset aléatoire dans les données
-    const bytesPerSample = Math.ceil(header.nbits / 8) * (header.nchans || 1);
+    const bytesPerSample = Math.ceil((header.nbits * (header.nchans || 1)) / 8);
     const chunkBytes = CHUNK_SAMPLES * bytesPerSample;
-    const maxDataOffset = 50 * 1024 * 1024; // Échantillonner dans les 50 premiers Mo
+    const maxDataOffset = 512 * 1024; // Rester dans les 512 Ko de données
 
     const dataOffset = header.headerSize + Math.floor(Math.random() * maxDataOffset);
     const rangeEnd = dataOffset + chunkBytes - 1;
@@ -146,7 +146,11 @@ export async function fetchBLChunk(): Promise<{
       signal: AbortSignal.timeout(8000),
     });
 
-    if (!dataRes.ok && dataRes.status !== 206) return null;
+    console.log(`[BL] Data fetch status: ${dataRes.status}, range: ${dataOffset}-${rangeEnd}`);
+    if (!dataRes.ok && dataRes.status !== 206) {
+      console.warn(`[BL] Data fetch échoué: ${dataRes.status}`);
+      return null;
+    }
 
     const dataBuf = Buffer.from(await dataRes.arrayBuffer());
 
@@ -178,7 +182,10 @@ export async function fetchBLChunk(): Promise<{
     // Compléter si trop court
     while (samples.length < CHUNK_SAMPLES) samples.push(0);
 
-    const frequencyHz = Math.abs(header.fch1) * 1_000_000;
+    // Utiliser 1420 MHz (ligne hydrogène) si fch1 non défini ou invalide
+    const frequencyHz = header.fch1 && Math.abs(header.fch1) > 1
+      ? Math.abs(header.fch1) * 1_000_000
+      : 1420000000 + Math.floor(Math.random() * 1_000_000);
 
     return { data: samples.slice(0, CHUNK_SAMPLES), frequencyHz, source: 'breakthrough_listen' };
 
