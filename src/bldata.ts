@@ -7,11 +7,9 @@
 const CHUNK_SAMPLES = 1024;
 const HEADER_FETCH_BYTES = 8192;
 
-// Fichiers .fil publics — données réelles de radiotélescopes
+// Fichiers .fil publics — données réelles de radiotélescopes (format SIGPROC vérifié)
 const PUBLIC_FIL_URLS = [
   'https://raw.githubusercontent.com/FRBs/sigpyproc3/main/tests/data/tutorial.fil',
-  'https://raw.githubusercontent.com/FRBs/sigpyproc3/main/tests/data/parkes_8bit_1.fil',
-  'https://raw.githubusercontent.com/FRBs/sigpyproc3/main/tests/data/parkes_8bit_2.fil',
   'https://raw.githubusercontent.com/thepetabyteproject/your/main/tests/data/28.fil',
 ];
 
@@ -96,11 +94,24 @@ export async function fetchBLChunk(): Promise<{
   frequencyHz: number;
   source: 'breakthrough_listen';
 } | null> {
-  // Priorité : URL personnalisée BL, sinon données publiques Parkes
+  // Priorité : URL personnalisée BL, sinon données publiques
   const customUrl = process.env.BREAKTHROUGH_LISTEN_URL;
-  const candidates = customUrl ? [customUrl] : PUBLIC_FIL_URLS;
-  const url = candidates[Math.floor(Math.random() * candidates.length)];
+  const candidates = customUrl
+    ? [customUrl]
+    : [...PUBLIC_FIL_URLS].sort(() => Math.random() - 0.5); // ordre aléatoire
 
+  for (const url of candidates) {
+    const result = await tryFetchFromUrl(url);
+    if (result) return result;
+  }
+  return null;
+}
+
+async function tryFetchFromUrl(url: string): Promise<{
+  data: number[];
+  frequencyHz: number;
+  source: 'breakthrough_listen';
+} | null> {
   if (!url) return null;
 
   console.log(`[BL] Tentative fetch: ${url.split('/').pop()}`);
