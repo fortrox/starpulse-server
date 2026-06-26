@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import { Pool } from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 
 const app = express();
@@ -8,53 +9,52 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// ─── PostgreSQL ───────────────────────────────────────────────────────────────
 
-interface Chunk {
-  id: string;
-  frequencyHz: number;
-  data: number[];
-  createdAt: number;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+});
+
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS contributors (
+      user_id       TEXT PRIMARY KEY,
+      points        DOUBLE PRECISION DEFAULT 0,
+      tokens        DOUBLE PRECISION DEFAULT 0,
+      anomalies     INTEGER DEFAULT 0,
+      compute_minutes DOUBLE PRECISION DEFAULT 0,
+      streak        INTEGER DEFAULT 0,
+      last_seen     BIGINT DEFAULT 0
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS results (
+      id              SERIAL PRIMARY KEY,
+      chunk_id        TEXT NOT NULL,
+      user_id         TEXT NOT NULL,
+      anomaly_detected BOOLEAN DEFAULT FALSE,
+      confidence      DOUBLE PRECISION DEFAULT 0,
+      snr_db          DOUBLE PRECISION DEFAULT 0,
+      duration        DOUBLE PRECISION DEFAULT 0,
+      timestamp       BIGINT NOT NULL
+    )
+  `);
+
+  console.log('✓ Database ready');
 }
-
-interface AnalysisResult {
-  chunkId: string;
-  userId: string;
-  anomalyDetected: boolean;
-  confidence: number;
-  snrDb: number;
-  duration: number;
-  timestamp: number;
-}
-
-interface Contributor {
-  userId: string;
-  points: number;
-  tokens: number;
-  anomalies: number;
-  computeMinutes: number;
-  streak: number;
-  lastSeen: number;
-}
-
-// ─── Stockage en mémoire (V1 — remplacer par DB en V2) ───────────────────────
-
-const results: AnalysisResult[] = [];
-const contributors = new Map<string, Contributor>();
-const anomalyLog: AnalysisResult[] = [];
 
 // ─── Utilitaires ─────────────────────────────────────────────────────────────
 
-function generateChunk(): Chunk {
+function generateChunk() {
   const size = 1024;
   const data: number[] = [];
 
-  // Bruit de fond cosmique synthétique
   for (let i = 0; i < size; i++) {
     data.push((Math.random() - 0.5) * 2);
   }
 
-  // 3% de chance d'injecter un signal
   if (Math.random() < 0.03) {
     const pos = Math.floor(Math.random() * size);
     const width = Math.floor(Math.random() * 20) + 5;
@@ -82,111 +82,171 @@ function calculateRewards(minutes: number, anomalies: number, streak: number) {
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
-// GET /health — vérification serveur
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    version: '1.0.0',
-    contributors: contributors.size,
-    resultsProcessed: results.length,
-    anomaliesFound: anomalyLog.length,
-    uptime: Math.floor(process.uptime()),
-  });
+// GET /health
+app.get('/health', async (_req, res) => {
+  try {
+    const [c, r, a] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM contributors'),
+      pool.query('SELECT COUNT(*) FROM results'),
+      pool.query('SELECT COUNT(*) FROM results WHERE anomaly_detected = TRUE'),
+    ]);
+    res.json({
+      status: 'ok',
+      version: '2.0.0',
+      contributors: parseInt(c.rows[0].count),
+      resultsProcessed: parseInt(r.rows[0].count),
+      anomaliesFound: parseInt(a.rows[0].count),
+      uptime: Math.floor(process.uptime()),
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: String(err) });
+  }
 });
 
-// GET /chunk — récupère un chunk à analyser
+// GET /chunk
 app.get('/chunk', (_req, res) => {
-  const chunk = generateChunk();
-  res.json(chunk);
+  res.json(generateChunk());
 });
 
-// POST /result — soumet le résultat d'un chunk analysé
-app.post('/result', (req, res) => {
-  const body = req.body as AnalysisResult;
+// POST /result
+app.post('/result', async (req, res) => {
+  const body = req.body;
 
   if (!body.chunkId || !body.userId) {
     return res.status(400).json({ error: 'chunkId and userId required' });
   }
 
-  const result: AnalysisResult = {
-    chunkId: body.chunkId,
-    userId: body.userId,
-    anomalyDetected: body.anomalyDetected ?? false,
-    confidence: body.confidence ?? 0,
-    snrDb: body.snrDb ?? 0,
-    duration: body.duration ?? 0,
-    timestamp: Date.now(),
-  };
+  const anomalyDetected = body.anomalyDetected ?? false;
+  const confidence = body.confidence ?? 0;
+  const snrDb = body.snrDb ?? 0;
+  const duration = body.duration ?? 0;
+  const timestamp = Date.now();
 
-  results.push(result);
-  if (result.anomalyDetected) anomalyLog.push(result);
+  try {
+    await pool.query(
+      `INSERT INTO results (chunk_id, user_id, anomaly_detected, confidence, snr_db, duration, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [body.chunkId, body.userId, anomalyDetected, confidence, snrDb, duration, timestamp]
+    );
 
-  // Mettre à jour les stats du contributeur
-  const existing = contributors.get(result.userId) ?? {
-    userId: result.userId,
-    points: 0,
-    tokens: 0,
-    anomalies: 0,
-    computeMinutes: 0,
-    streak: 0,
-    lastSeen: 0,
-  };
+    // Récupérer le streak actuel
+    const existing = await pool.query(
+      'SELECT streak FROM contributors WHERE user_id = $1',
+      [body.userId]
+    );
+    const streak = existing.rows[0]?.streak ?? 0;
+    const minutes = Math.ceil(duration / 60);
+    const { points, tokens } = calculateRewards(minutes, anomalyDetected ? 1 : 0, streak);
 
-  const minutes = Math.ceil(result.duration / 60);
-  if (result.anomalyDetected) existing.anomalies += 1;
-  existing.computeMinutes += minutes;
-  existing.lastSeen = Date.now();
+    // Upsert contributeur
+    await pool.query(
+      `INSERT INTO contributors (user_id, points, tokens, anomalies, compute_minutes, streak, last_seen)
+       VALUES ($1, $2, $3, $4, $5, 0, $6)
+       ON CONFLICT (user_id) DO UPDATE SET
+         points          = contributors.points + $2,
+         tokens          = contributors.tokens + $3,
+         anomalies       = contributors.anomalies + $4,
+         compute_minutes = contributors.compute_minutes + $5,
+         last_seen       = $6`,
+      [body.userId, points, tokens, anomalyDetected ? 1 : 0, minutes, timestamp]
+    );
 
-  const { points, tokens } = calculateRewards(minutes, result.anomalyDetected ? 1 : 0, existing.streak);
-  existing.points += points;
-  existing.tokens += tokens;
-
-  contributors.set(result.userId, existing);
-
-  return res.json({ success: true, pointsEarned: points, tokensEarned: tokens });
+    return res.json({ success: true, pointsEarned: points, tokensEarned: tokens });
+  } catch (err) {
+    return res.status(500).json({ error: String(err) });
+  }
 });
 
-// GET /leaderboard — top 20 contributeurs
-app.get('/leaderboard', (_req, res) => {
-  const top = Array.from(contributors.values())
-    .sort((a, b) => b.points - a.points)
-    .slice(0, 20)
-    .map((c, i) => ({ rank: i + 1, ...c }));
-
-  res.json({ leaderboard: top, total: contributors.size });
+// GET /leaderboard
+app.get('/leaderboard', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT user_id, points, tokens, anomalies, compute_minutes, streak
+       FROM contributors
+       ORDER BY points DESC
+       LIMIT 20`
+    );
+    const total = await pool.query('SELECT COUNT(*) FROM contributors');
+    const leaderboard = rows.map((r, i) => ({
+      rank: i + 1,
+      userId: r.user_id,
+      points: r.points,
+      tokens: r.tokens,
+      anomalies: r.anomalies,
+      computeMinutes: r.compute_minutes,
+      streak: r.streak,
+    }));
+    res.json({ leaderboard, total: parseInt(total.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
 });
 
-// GET /stats/global — stats globales du réseau
-app.get('/stats/global', (_req, res) => {
-  const totalMinutes = Array.from(contributors.values())
-    .reduce((sum, c) => sum + c.computeMinutes, 0);
-
-  res.json({
-    totalContributors: contributors.size,
-    totalResultsProcessed: results.length,
-    totalAnomaliesFound: anomalyLog.length,
-    totalComputeMinutes: totalMinutes,
-    recentAnomalies: anomalyLog.slice(-5),
-  });
+// GET /stats/global
+app.get('/stats/global', async (_req, res) => {
+  try {
+    const [contrib, processed, anomalies, minutes, recent] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM contributors'),
+      pool.query('SELECT COUNT(*) FROM results'),
+      pool.query('SELECT COUNT(*) FROM results WHERE anomaly_detected = TRUE'),
+      pool.query('SELECT COALESCE(SUM(compute_minutes), 0) AS total FROM contributors'),
+      pool.query(
+        'SELECT * FROM results WHERE anomaly_detected = TRUE ORDER BY timestamp DESC LIMIT 5'
+      ),
+    ]);
+    res.json({
+      totalContributors: parseInt(contrib.rows[0].count),
+      totalResultsProcessed: parseInt(processed.rows[0].count),
+      totalAnomaliesFound: parseInt(anomalies.rows[0].count),
+      totalComputeMinutes: parseFloat(minutes.rows[0].total),
+      recentAnomalies: recent.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
 });
 
-// GET /stats/user/:userId — stats d'un contributeur
-app.get('/stats/user/:userId', (req, res) => {
-  const user = contributors.get(req.params.userId);
-  if (!user) return res.status(404).json({ error: 'User not found' });
+// GET /stats/user/:userId
+app.get('/stats/user/:userId', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM contributors WHERE user_id = $1',
+      [req.params.userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
 
-  const rank = Array.from(contributors.values())
-    .sort((a, b) => b.points - a.points)
-    .findIndex((c) => c.userId === req.params.userId) + 1;
+    const rankResult = await pool.query(
+      `SELECT COUNT(*) FROM contributors WHERE points > $1`,
+      [rows[0].points]
+    );
+    const rank = parseInt(rankResult.rows[0].count) + 1;
+    const u = rows[0];
 
-  return res.json({ ...user, rank });
+    return res.json({
+      userId: u.user_id,
+      points: u.points,
+      tokens: u.tokens,
+      anomalies: u.anomalies,
+      computeMinutes: u.compute_minutes,
+      streak: u.streak,
+      lastSeen: u.last_seen,
+      rank,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: String(err) });
+  }
 });
 
 // ─── Démarrage ───────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
-  console.log(`★ StarPulse Server running on port ${PORT}`);
-  console.log(`   Health : http://localhost:${PORT}/health`);
-  console.log(`   Chunk  : http://localhost:${PORT}/chunk`);
-  console.log(`   Board  : http://localhost:${PORT}/leaderboard`);
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`★ StarPulse Server v2.0.0 running on port ${PORT}`);
+    console.log(`   Health : http://localhost:${PORT}/health`);
+    console.log(`   Chunk  : http://localhost:${PORT}/chunk`);
+    console.log(`   Board  : http://localhost:${PORT}/leaderboard`);
+  });
+}).catch((err) => {
+  console.error('Failed to initialize database:', err);
+  process.exit(1);
 });
