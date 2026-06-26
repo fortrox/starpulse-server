@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { Pool } from 'pg';
 import { v4 as uuidv4 } from 'uuid';
+import { fetchBLChunk } from './bldata';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -104,8 +105,10 @@ app.get('/health', async (_req, res) => {
 });
 
 // GET /chunk
-app.get('/chunk', (_req, res) => {
-  res.json(generateChunk());
+app.get('/chunk', async (_req, res) => {
+  const real = await fetchBLChunk();
+  if (real) return res.json({ id: uuidv4(), ...real, createdAt: Date.now() });
+  return res.json({ ...generateChunk(), source: 'simulation' });
 });
 
 // POST /result
