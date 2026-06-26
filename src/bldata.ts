@@ -1,11 +1,19 @@
-// Breakthrough Listen Open Data Archive — Filterbank fetcher
+// Real radio astronomy data fetcher
 // Format: .fil (SIGPROC filterbank) — https://sigproc.sourceforge.net/
 //
-// Pour configurer : ajouter BREAKTHROUGH_LISTEN_URL dans les variables Railway
-// Exemple : http://bldata.berkeley.edu/GBT/.../<fichier>.fil
+// Sources par défaut : données publiques du télescope Parkes (Australie)
+// Source personnalisée : variable BREAKTHROUGH_LISTEN_URL dans Railway
 
 const CHUNK_SAMPLES = 1024;
 const HEADER_FETCH_BYTES = 8192;
+
+// Fichiers .fil publics — données réelles de radiotélescopes
+const PUBLIC_FIL_URLS = [
+  'https://raw.githubusercontent.com/FRBs/sigpyproc3/main/tests/data/tutorial.fil',
+  'https://raw.githubusercontent.com/FRBs/sigpyproc3/main/tests/data/parkes_8bit_1.fil',
+  'https://raw.githubusercontent.com/FRBs/sigpyproc3/main/tests/data/parkes_8bit_2.fil',
+  'https://raw.githubusercontent.com/thepetabyteproject/your/main/tests/data/28.fil',
+];
 
 interface FilterbankHeader {
   nchans: number;
@@ -88,7 +96,11 @@ export async function fetchBLChunk(): Promise<{
   frequencyHz: number;
   source: 'breakthrough_listen';
 } | null> {
-  const url = process.env.BREAKTHROUGH_LISTEN_URL;
+  // Priorité : URL personnalisée BL, sinon données publiques Parkes
+  const customUrl = process.env.BREAKTHROUGH_LISTEN_URL;
+  const candidates = customUrl ? [customUrl] : PUBLIC_FIL_URLS;
+  const url = candidates[Math.floor(Math.random() * candidates.length)];
+
   if (!url) return null;
 
   try {
@@ -98,7 +110,7 @@ export async function fetchBLChunk(): Promise<{
     if (!header) {
       const res = await fetch(url, {
         headers: { Range: `bytes=0-${HEADER_FETCH_BYTES - 1}` },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(10000),
       });
 
       if (!res.ok && res.status !== 206) return null;
