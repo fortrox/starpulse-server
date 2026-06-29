@@ -2,29 +2,38 @@
 // Format: .fil (SIGPROC filterbank) — https://sigproc.sourceforge.net/
 //
 // Source : API publique Breakthrough Listen (UC Berkeley)
-//   → http://seti.berkeley.edu/opendata/api
-//   → Données GBT (Green Bank Telescope) et Parkes réelles
-//   → Fichiers hébergés sur blpd0.ssl.berkeley.edu (range requests HTTP 206 OK)
+//   → https://seti.berkeley.edu/opendata/api (HTTPS)
+//   → Fichiers GCS uniquement (storage.googleapis.com — HTTPS, range requests OK)
 //   → 0 auth requise
 //
-// Ces observations sont des données RÉELLES non entièrement analysées :
-//   → turboSETI cherche uniquement les signaux narrowband drifting
-//   → Autres types de signaux (large-bande, courte durée) → non analysés
-//   → Chaque utilisateur StarPulse a une vraie chance de découverte
+// Données réelles GBT analysées pour signaux narrowband uniquement (turboSETI)
+// Notre algo SNR cherche signaux LARGE-BANDE — non couverts par BL pipeline
 
 import { v4 as uuidv4 } from 'uuid';
 
-const BL_API_BASE = 'http://seti.berkeley.edu/opendata/api';
+const BL_API_BASE = 'https://seti.berkeley.edu/opendata/api';
 const CHUNK_SAMPLES = 1024;
 const HEADER_FETCH_BYTES = 8192;
+const FETCH_TIMEOUT_MS = 20000;
 
-// Cibles SETI emblématiques avec données GBT confirmées
+// Cibles SETI avec données GBT
 const SETI_TARGETS = [
   'TRAPPIST1', 'PROXCEN', 'ALPHACEN', 'TAUCETI', 'EPSILON_ERI',
-  'KEPLER452B', 'GJ667C', 'HD40307G', 'HIP99427', 'HIP45293',
-  'HIP88972', 'HIP17092', 'HIP66765', 'HIP47006', 'HIP75181',
-  'BARNARDS_STAR', 'LUYMANS_STAR', 'WOLF359', 'LALANDE21185',
-  'GJ832', 'GJ876', 'GJ1214', 'HD209458', 'HIP22627',
+  'KEPLER452B', 'GJ667C', 'HIP99427', 'HIP45293', 'HIP88972',
+  'HIP17092', 'HIP66765', 'GJ832', 'GJ876', 'GJ1214',
+  'BARNARDS_STAR', 'WOLF359', 'HIP22627', 'HIP75181', 'HD40307G',
+];
+
+// URLs GCS confirmées — HTTPS, range requests 206 OK, données GBT réelles
+// Ces fichiers sont des vraies observations analysées pour narrowband seulement
+const GCS_STATIC_POOL: Array<{ url: string; target: string; telescope: string; utc: string; center_freq: number }> = [
+  {
+    url: 'https://storage.googleapis.com/gbt_fil/voyager_f1032192_t300_v2.fil',
+    target: 'Voyager1',
+    telescope: 'GBT',
+    utc: 'Wed, 18 Dec 2013 00:00:00 GMT',
+    center_freq: 8420,
+  },
 ];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -33,55 +42,57 @@ interface BLFileEntry {
   target: string;
   telescope: string;
   utc: string;
-  center_freq: number; // MHz
+  center_freq: number;
   url: string;
-  ra?: number;
-  decl?: number;
   size?: number;
 }
 
 interface FilterbankHeader {
   nchans: number;
   nbits: number;
-  fch1: number;   // MHz
-  foff: number;   // MHz
-  tsamp: number;  // secondes
+  fch1: number;
+  foff: number;
+  tsamp: number;
   headerSize: number;
 }
 
 // ─── Cache ────────────────────────────────────────────────────────────────────
 
-// Cache par cible : target → liste de fichiers
 const fileCache = new Map<string, { files: BLFileEntry[]; ts: number }>();
-const CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12h
+const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const headerCache = new Map<string, FilterbankHeader>();
 
-// ─── Query API BL pour une cible ─────────────────────────────────────────────
+// ─── Query API BL — filtre GCS uniquement ────────────────────────────────────
 
 async function queryFilesForTarget(target: string): Promise<BLFileEntry[]> {
   const cached = fileCache.get(target);
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.files;
 
-  const params = new URLSearchParams({
-    target,
-    'file-types': 'filterbank',
-    limit: '20',
-  });
-
+  const params = new URLSearchParams({ target, 'file-types': 'filterbank', limit: '30' });
   const url = `${BL_API_BASE}/query-files?${params}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-  if (!res.ok) return [];
 
-  const json = await res.json() as { result: string; data?: BLFileEntry[] };
-  if (json.result !== 'success' || !json.data?.length) return [];
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    if (!res.ok) return [];
 
-  // Préférer les petits fichiers (< 50 Mo) pour les range requests rapides
-  const files = json.data
-    .filter(f => f.url && (!f.size || f.size < 50 * 1024 * 1024))
-    .slice(0, 10);
+    const json = await res.json() as { result: string; data?: BLFileEntry[] };
+    if (json.result !== 'success' || !json.data?.length) return [];
 
-  if (files.length > 0) fileCache.set(target, { files, ts: Date.now() });
-  return files;
+    // On garde UNIQUEMENT les URLs GCS (HTTPS, fiables depuis Railway)
+    const files = json.data.filter(f =>
+      f.url &&
+      f.url.startsWith('https://storage.googleapis.com') &&
+      (!f.size || f.size < 200 * 1024 * 1024)
+    );
+
+    console.log(`[BL] ${target}: ${json.data.length} fichiers total, ${files.length} sur GCS`);
+
+    if (files.length > 0) fileCache.set(target, { files, ts: Date.now() });
+    return files;
+  } catch (err) {
+    console.warn(`[BL] API query ${target} échouée:`, String(err));
+    return [];
+  }
 }
 
 // ─── Parser header filterbank (SIGPROC) ──────────────────────────────────────
@@ -148,35 +159,33 @@ async function tryFetchFromEntry(entry: BLFileEntry): Promise<{
   if (!url) return null;
 
   try {
-    // Header (avec cache)
     let header = headerCache.get(url);
 
     if (!header) {
       const res = await fetch(url, {
         headers: { Range: `bytes=0-${HEADER_FETCH_BYTES - 1}` },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
       if (res.status !== 206 && !res.ok) return null;
 
       const buf = Buffer.from(await res.arrayBuffer());
       header = parseFilterbankHeader(buf) ?? undefined;
-      if (!header) return null;
+      if (!header) { console.warn(`[BL] Header non parseable: ${target}`); return null; }
 
       headerCache.set(url, header);
-      console.log(`[BL] Header OK — ${target} ${header.nchans}ch ${header.nbits}bits ${header.fch1.toFixed(1)}MHz`);
+      console.log(`[BL] ✓ Header ${target} — ${header.nchans}ch ${header.nbits}bits ${header.fch1.toFixed(1)}MHz`);
     }
 
-    // Offset aléatoire (max 1 Mo dans les données)
     const bytesPerSample = Math.ceil((header.nbits * (header.nchans || 1)) / 8);
     const chunkBytes = CHUNK_SAMPLES * bytesPerSample;
-    const maxDataOffset = 1024 * 1024;
+    const maxDataOffset = 2 * 1024 * 1024;
 
     const dataOffset = header.headerSize + Math.floor(Math.random() * maxDataOffset);
     const rangeEnd = dataOffset + chunkBytes - 1;
 
     const dataRes = await fetch(url, {
       headers: { Range: `bytes=${dataOffset}-${rangeEnd}` },
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
     if (dataRes.status !== 206 && !dataRes.ok) return null;
 
@@ -235,7 +244,6 @@ export async function fetchBLChunk(): Promise<{
   observationUtc: string;
   chunkId: string;
 } | null> {
-  // URL personnalisée prioritaire (Railway env var)
   const customUrl = process.env.BREAKTHROUGH_LISTEN_URL;
   if (customUrl) {
     const result = await tryFetchFromEntry({
@@ -245,21 +253,21 @@ export async function fetchBLChunk(): Promise<{
     if (result) return result;
   }
 
-  // Rotation aléatoire sur les cibles SETI
+  // 1. Essai API BL (HTTPS) — récupère fichiers GCS uniquement
   const shuffledTargets = [...SETI_TARGETS].sort(() => Math.random() - 0.5);
+  for (const target of shuffledTargets.slice(0, 3)) {
+    const files = await queryFilesForTarget(target);
+    if (!files.length) continue;
+    const entry = files[Math.floor(Math.random() * files.length)]!;
+    const result = await tryFetchFromEntry(entry);
+    if (result) return result;
+  }
 
-  for (const target of shuffledTargets.slice(0, 4)) {
-    try {
-      const files = await queryFilesForTarget(target);
-      if (!files.length) continue;
-
-      // Fichier aléatoire parmi les résultats
-      const entry = files[Math.floor(Math.random() * files.length)]!;
-      const result = await tryFetchFromEntry(entry);
-      if (result) return result;
-    } catch (err) {
-      console.warn(`[BL] Échec target ${target}:`, String(err));
-    }
+  // 2. Fallback : pool statique GCS confirmé
+  const pool = [...GCS_STATIC_POOL].sort(() => Math.random() - 0.5);
+  for (const entry of pool) {
+    const result = await tryFetchFromEntry(entry);
+    if (result) return result;
   }
 
   return null;
