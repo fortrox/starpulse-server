@@ -253,6 +253,8 @@ export async function fetchBLChunk(): Promise<{
     if (result) return result;
   }
 
+  console.log('[BL] fetchBLChunk() appelé');
+
   // 1. Essai API BL (HTTPS) — récupère fichiers GCS uniquement
   const shuffledTargets = [...SETI_TARGETS].sort(() => Math.random() - 0.5);
   for (const target of shuffledTargets.slice(0, 3)) {
@@ -263,12 +265,15 @@ export async function fetchBLChunk(): Promise<{
     if (result) return result;
   }
 
-  // 2. Fallback : pool statique GCS confirmé
+  // 2. Fallback : pool statique GCS confirmé (HTTPS, Railway-compatible)
+  console.log('[BL] Passage au fallback GCS statique...');
   const pool = [...GCS_STATIC_POOL].sort(() => Math.random() - 0.5);
   for (const entry of pool) {
+    console.log('[BL] Tentative GCS:', entry.url.split('/').pop());
     const result = await tryFetchFromEntry(entry);
-    if (result) return result;
+    if (result) { console.log('[BL] ✓ GCS fallback OK'); return result; }
   }
 
+  console.log('[BL] Tous les fetch ont échoué → simulation');
   return null;
 }
