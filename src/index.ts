@@ -113,41 +113,49 @@ app.get('/health', async (_req, res) => {
   }
 });
 
-// ─── Cache chunk GBT (pré-fetch en background) ───────────────────────────────
-// Le fetch GCS peut prendre 5-15s → on pré-charge le prochain chunk en avance
-// pour que /chunk réponde immédiatement avec de vraies données.
+// ─── Pool de chunks GBT pré-fetchés ──────────────────────────────────────────
+// Le fetch GCS prend 8-15s. On maintient un pool de 3 chunks en avance
+// pour que /chunk réponde quasi-instantanément même en scan loop rapide.
 
 type CachedChunk = Awaited<ReturnType<typeof fetchBLChunk>>;
-let chunkCache: CachedChunk = null;
-let cacheRefreshing = false;
+const POOL_SIZE = 3;
+const chunkPool: CachedChunk[] = [];
+let poolRefreshing = false;
 
-async function refreshCache() {
-  if (cacheRefreshing) return;
-  cacheRefreshing = true;
+async function fillPool() {
+  if (poolRefreshing) return;
+  poolRefreshing = true;
   try {
-    const chunk = await fetchBLChunk();
-    if (chunk) { chunkCache = chunk; console.log(`[Cache] Chunk prêt: ${chunk.target} ${(chunk.frequencyHz/1e6).toFixed(1)}MHz`); }
+    while (chunkPool.length < POOL_SIZE) {
+      const chunk = await fetchBLChunk();
+      if (chunk) {
+        chunkPool.push(chunk);
+        console.log(`[Pool] +chunk ${chunk.target} ${(chunk.frequencyHz/1e6).toFixed(1)}MHz — pool: ${chunkPool.length}/${POOL_SIZE}`);
+      } else {
+        break; // pas de données dispo, on arrête
+      }
+    }
   } catch (e) {
-    console.warn('[Cache] Erreur refresh:', String(e));
+    console.warn('[Pool] Erreur fill:', String(e));
   } finally {
-    cacheRefreshing = false;
+    poolRefreshing = false;
   }
 }
 
-// Pré-chargement initial au démarrage du serveur
-setTimeout(refreshCache, 2000);
+// Remplissage initial au démarrage
+setTimeout(fillPool, 1000);
 
 // GET /chunk
 app.get('/chunk', async (_req, res) => {
-  if (chunkCache) {
-    const { chunkId, ...rest } = chunkCache;
-    chunkCache = null;            // consommé
-    refreshCache();               // prépare le suivant en arrière-plan
+  const cached = chunkPool.shift(); // prend le premier chunk dispo
+  if (cached) {
+    fillPool(); // re-remplit en arrière-plan
+    const { chunkId, ...rest } = cached;
     return res.json({ id: chunkId, ...rest, createdAt: Date.now() });
   }
-  // Cache vide : on attend le fetch (première requête ou après erreur)
+  // Pool vide : attend un fetch direct (rare — seulement au tout début)
   const real = await fetchBLChunk();
-  refreshCache(); // lance le suivant
+  fillPool();
   if (real) {
     const { chunkId, ...rest } = real;
     return res.json({ id: chunkId, ...rest, createdAt: Date.now() });
