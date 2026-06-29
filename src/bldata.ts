@@ -1,22 +1,31 @@
 // Real radio astronomy data fetcher
 // Format: .fil (SIGPROC filterbank) — https://sigproc.sourceforge.net/
 //
-// Source principale : API publique Breakthrough Listen (UC Berkeley)
-//   → http://seti.berkeley.edu/opendata/api/query-files
-//   → Données GBT (Green Bank Telescope) réelles, bande L (1.1–1.9 GHz)
-//   → Fichiers hébergés sur Google Cloud Storage (range requests supportés, 0 auth)
+// Source : API publique Breakthrough Listen (UC Berkeley)
+//   → http://seti.berkeley.edu/opendata/api
+//   → Données GBT (Green Bank Telescope) et Parkes réelles
+//   → Fichiers hébergés sur blpd0.ssl.berkeley.edu (range requests HTTP 206 OK)
+//   → 0 auth requise
 //
-// Ces observations sont des données RÉELLES du GBT non entièrement analysées :
-//   → turboSETI a cherché des signaux à bande étroite (narrowband drifting)
-//   → Signaux large-bande, non-dérivanats, à courte durée → PAS encore analysés
-//   → Chaque utilisateur a une vraie chance de découverte
+// Ces observations sont des données RÉELLES non entièrement analysées :
+//   → turboSETI cherche uniquement les signaux narrowband drifting
+//   → Autres types de signaux (large-bande, courte durée) → non analysés
+//   → Chaque utilisateur StarPulse a une vraie chance de découverte
 
 import { v4 as uuidv4 } from 'uuid';
 
 const BL_API_BASE = 'http://seti.berkeley.edu/opendata/api';
 const CHUNK_SAMPLES = 1024;
 const HEADER_FETCH_BYTES = 8192;
-const API_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+
+// Cibles SETI emblématiques avec données GBT confirmées
+const SETI_TARGETS = [
+  'TRAPPIST1', 'PROXCEN', 'ALPHACEN', 'TAUCETI', 'EPSILON_ERI',
+  'KEPLER452B', 'GJ667C', 'HD40307G', 'HIP99427', 'HIP45293',
+  'HIP88972', 'HIP17092', 'HIP66765', 'HIP47006', 'HIP75181',
+  'BARNARDS_STAR', 'LUYMANS_STAR', 'WOLF359', 'LALANDE21185',
+  'GJ832', 'GJ876', 'GJ1214', 'HD209458', 'HIP22627',
+];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -28,6 +37,7 @@ interface BLFileEntry {
   url: string;
   ra?: number;
   decl?: number;
+  size?: number;
 }
 
 interface FilterbankHeader {
@@ -41,69 +51,37 @@ interface FilterbankHeader {
 
 // ─── Cache ────────────────────────────────────────────────────────────────────
 
-let cachedFileList: BLFileEntry[] = [];
-let lastApiQueryMs = 0;
+// Cache par cible : target → liste de fichiers
+const fileCache = new Map<string, { files: BLFileEntry[]; ts: number }>();
+const CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12h
 const headerCache = new Map<string, FilterbankHeader>();
 
-// ─── Fallback : fichiers GBT connus accessibles sans API ──────────────────────
-// Source : UCBerkeleySETI/breakthrough (GitHub public)
-const FALLBACK_FIL_URLS: string[] = [
-  'https://storage.googleapis.com/gbt_fil/voyager_f1032192_t300_v2.fil',
-];
+// ─── Query API BL pour une cible ─────────────────────────────────────────────
 
-// ─── Query API Breakthrough Listen ────────────────────────────────────────────
+async function queryFilesForTarget(target: string): Promise<BLFileEntry[]> {
+  const cached = fileCache.get(target);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.files;
 
-async function queryBLArchive(): Promise<BLFileEntry[]> {
-  // Bande L autour de 1420 MHz (raie hydrogène)
   const params = new URLSearchParams({
-    telescopes: 'GBT',
+    target,
     'file-types': 'filterbank',
-    'freq-start': '1300',
-    'freq-end': '1600',
-    limit: '100',
+    limit: '20',
   });
 
   const url = `${BL_API_BASE}/query-files?${params}`;
-  console.log('[BL] Interrogation API archive Breakthrough Listen…');
+  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) return [];
 
-  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
-  if (!res.ok) throw new Error(`API BL HTTP ${res.status}`);
+  const json = await res.json() as { result: string; data?: BLFileEntry[] };
+  if (json.result !== 'success' || !json.data?.length) return [];
 
-  const json = await res.json() as { data?: BLFileEntry[] };
-  const files = (json.data ?? []).filter(f => f.url && f.url.length > 0);
+  // Préférer les petits fichiers (< 50 Mo) pour les range requests rapides
+  const files = json.data
+    .filter(f => f.url && (!f.size || f.size < 50 * 1024 * 1024))
+    .slice(0, 10);
 
-  console.log(`[BL] ${files.length} fichiers GBT trouvés via API`);
+  if (files.length > 0) fileCache.set(target, { files, ts: Date.now() });
   return files;
-}
-
-async function getFileList(): Promise<BLFileEntry[]> {
-  const now = Date.now();
-  if (cachedFileList.length > 0 && now - lastApiQueryMs < API_CACHE_TTL_MS) {
-    return cachedFileList;
-  }
-
-  try {
-    const files = await queryBLArchive();
-    if (files.length > 0) {
-      cachedFileList = files;
-      lastApiQueryMs = now;
-      return files;
-    }
-  } catch (err) {
-    console.warn('[BL] API query échouée, utilisation cache/fallback:', String(err));
-  }
-
-  // Si cache non vide mais expiré, on le garde encore
-  if (cachedFileList.length > 0) return cachedFileList;
-
-  // Fallback : fichiers statiques connus
-  return FALLBACK_FIL_URLS.map(url => ({
-    target: 'GBT_Observation',
-    telescope: 'GBT',
-    utc: new Date().toISOString(),
-    center_freq: 1420,
-    url,
-  }));
 }
 
 // ─── Parser header filterbank (SIGPROC) ──────────────────────────────────────
@@ -114,7 +92,6 @@ function parseFilterbankHeader(buf: Buffer): FilterbankHeader | null {
 
   const startIdx = buf.indexOf(HEADER_START);
   if (startIdx === -1) return null;
-
   const endIdx = buf.indexOf(HEADER_END);
   if (endIdx === -1) return null;
 
@@ -129,34 +106,25 @@ function parseFilterbankHeader(buf: Buffer): FilterbankHeader | null {
 
   while (pos < endIdx - 4) {
     if (pos + 4 > buf.length) break;
-    const keyLen = buf.readInt32LE(pos);
-    pos += 4;
-
+    const keyLen = buf.readInt32LE(pos); pos += 4;
     if (keyLen <= 0 || keyLen > 80 || pos + keyLen > buf.length) break;
-    const key = buf.subarray(pos, pos + keyLen).toString('ascii');
-    pos += keyLen;
-
+    const key = buf.subarray(pos, pos + keyLen).toString('ascii'); pos += keyLen;
     if (key === HEADER_END) break;
 
     if (intKeys.includes(key)) {
       if (pos + 4 > buf.length) break;
-      const val = buf.readInt32LE(pos);
-      pos += 4;
+      const val = buf.readInt32LE(pos); pos += 4;
       if (key === 'nchans') header.nchans = val;
       if (key === 'nbits') header.nbits = val;
-
     } else if (dblKeys.includes(key)) {
       if (pos + 8 > buf.length) break;
-      const val = buf.readDoubleBE(pos);
-      pos += 8;
+      const val = buf.readDoubleBE(pos); pos += 8;
       if (key === 'fch1') header.fch1 = val;
       if (key === 'foff') header.foff = val;
       if (key === 'tsamp') header.tsamp = val;
-
     } else if (strKeys.includes(key)) {
       if (pos + 4 > buf.length) break;
-      const strLen = buf.readInt32LE(pos);
-      pos += 4;
+      const strLen = buf.readInt32LE(pos); pos += 4;
       if (strLen > 0 && strLen < 256) pos += strLen;
     }
   }
@@ -165,7 +133,7 @@ function parseFilterbankHeader(buf: Buffer): FilterbankHeader | null {
   return header as FilterbankHeader;
 }
 
-// ─── Fetch d'un chunk réel ────────────────────────────────────────────────────
+// ─── Fetch d'un chunk depuis un fichier .fil ──────────────────────────────────
 
 async function tryFetchFromEntry(entry: BLFileEntry): Promise<{
   data: number[];
@@ -179,8 +147,6 @@ async function tryFetchFromEntry(entry: BLFileEntry): Promise<{
   const { url, target, telescope, utc } = entry;
   if (!url) return null;
 
-  console.log(`[BL] Fetch chunk depuis: ${target} (${url.split('/').pop()})`);
-
   try {
     // Header (avec cache)
     let header = headerCache.get(url);
@@ -188,56 +154,41 @@ async function tryFetchFromEntry(entry: BLFileEntry): Promise<{
     if (!header) {
       const res = await fetch(url, {
         headers: { Range: `bytes=0-${HEADER_FETCH_BYTES - 1}` },
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.timeout(8000),
       });
-
-      if (!res.ok && res.status !== 206) {
-        console.warn(`[BL] Header fetch échoué: HTTP ${res.status}`);
-        return null;
-      }
+      if (res.status !== 206 && !res.ok) return null;
 
       const buf = Buffer.from(await res.arrayBuffer());
       header = parseFilterbankHeader(buf) ?? undefined;
-
-      if (!header) {
-        console.warn('[BL] Header filterbank non parseable');
-        return null;
-      }
+      if (!header) return null;
 
       headerCache.set(url, header);
-      console.log(
-        `[BL] Header OK — ${header.nchans} canaux, ${header.nbits} bits, ${header.fch1.toFixed(3)} MHz`
-      );
+      console.log(`[BL] Header OK — ${target} ${header.nchans}ch ${header.nbits}bits ${header.fch1.toFixed(1)}MHz`);
     }
 
-    // Offset aléatoire dans les données (max 2 Mo pour éviter timeout)
+    // Offset aléatoire (max 1 Mo dans les données)
     const bytesPerSample = Math.ceil((header.nbits * (header.nchans || 1)) / 8);
     const chunkBytes = CHUNK_SAMPLES * bytesPerSample;
-    const maxDataOffset = 2 * 1024 * 1024; // 2 Mo
+    const maxDataOffset = 1024 * 1024;
 
     const dataOffset = header.headerSize + Math.floor(Math.random() * maxDataOffset);
     const rangeEnd = dataOffset + chunkBytes - 1;
 
     const dataRes = await fetch(url, {
       headers: { Range: `bytes=${dataOffset}-${rangeEnd}` },
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(8000),
     });
-
-    if (!dataRes.ok && dataRes.status !== 206) {
-      console.warn(`[BL] Data fetch échoué: HTTP ${dataRes.status}`);
-      return null;
-    }
+    if (dataRes.status !== 206 && !dataRes.ok) return null;
 
     const dataBuf = Buffer.from(await dataRes.arrayBuffer());
     const samples: number[] = [];
 
     if (header.nbits === 8) {
-      for (let i = 0; i < Math.min(CHUNK_SAMPLES, dataBuf.length); i++) {
+      for (let i = 0; i < Math.min(CHUNK_SAMPLES, dataBuf.length); i++)
         samples.push((dataBuf[i]! - 128) / 128);
-      }
     } else if (header.nbits === 32) {
-      const floatCount = Math.min(CHUNK_SAMPLES, Math.floor(dataBuf.length / 4));
-      for (let i = 0; i < floatCount; i++) {
+      const n = Math.min(CHUNK_SAMPLES, Math.floor(dataBuf.length / 4));
+      for (let i = 0; i < n; i++) {
         const val = dataBuf.readFloatLE(i * 4);
         samples.push(isFinite(val) ? Math.max(-1, Math.min(1, val / 100)) : 0);
       }
@@ -262,14 +213,13 @@ async function tryFetchFromEntry(entry: BLFileEntry): Promise<{
       data: samples.slice(0, CHUNK_SAMPLES),
       frequencyHz,
       source: 'breakthrough_listen',
-      target,
+      target: target.replace(/^DIAG_/, ''),
       telescope,
       observationUtc: utc,
       chunkId: uuidv4(),
     };
-
   } catch (err) {
-    console.warn('[BL] Erreur fetch chunk:', String(err));
+    console.warn(`[BL] Erreur fetch ${target}:`, String(err));
     return null;
   }
 }
@@ -285,28 +235,31 @@ export async function fetchBLChunk(): Promise<{
   observationUtc: string;
   chunkId: string;
 } | null> {
-  // URL personnalisée (Railway env var) → priorité absolue
+  // URL personnalisée prioritaire (Railway env var)
   const customUrl = process.env.BREAKTHROUGH_LISTEN_URL;
   if (customUrl) {
     const result = await tryFetchFromEntry({
-      url: customUrl,
-      target: 'Custom_BL_Source',
-      telescope: 'GBT',
-      utc: new Date().toISOString(),
-      center_freq: 1420,
+      url: customUrl, target: 'Custom_BL', telescope: 'GBT',
+      utc: new Date().toISOString(), center_freq: 1420,
     });
     if (result) return result;
   }
 
-  // API BL → liste dynamique de fichiers réels
-  const files = await getFileList();
+  // Rotation aléatoire sur les cibles SETI
+  const shuffledTargets = [...SETI_TARGETS].sort(() => Math.random() - 0.5);
 
-  // Mélanger et essayer jusqu'à 3 fichiers aléatoires
-  const shuffled = [...files].sort(() => Math.random() - 0.5).slice(0, 3);
+  for (const target of shuffledTargets.slice(0, 4)) {
+    try {
+      const files = await queryFilesForTarget(target);
+      if (!files.length) continue;
 
-  for (const entry of shuffled) {
-    const result = await tryFetchFromEntry(entry);
-    if (result) return result;
+      // Fichier aléatoire parmi les résultats
+      const entry = files[Math.floor(Math.random() * files.length)]!;
+      const result = await tryFetchFromEntry(entry);
+      if (result) return result;
+    } catch (err) {
+      console.warn(`[BL] Échec target ${target}:`, String(err));
+    }
   }
 
   return null;
