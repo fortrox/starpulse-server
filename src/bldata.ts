@@ -96,52 +96,73 @@ async function queryFilesForTarget(target: string): Promise<BLFileEntry[]> {
 }
 
 // ─── Parser header filterbank (SIGPROC) ──────────────────────────────────────
+// Recherche par pattern plutôt que parsing séquentiel — robuste aux keywords
+// inconnus (barycentric, pulsarcentric, etc.) qui désynchronisent le parser.
+
+function findIntInHeader(hdr: Buffer, name: string): number | undefined {
+  const nameBytes = Buffer.from(name);
+  const lenLE = Buffer.allocUnsafe(4);
+  lenLE.writeInt32LE(name.length, 0);
+  let pos = 0;
+  while (pos <= hdr.length - 4 - name.length - 4) {
+    if (hdr.subarray(pos, pos + 4).equals(lenLE) &&
+        hdr.subarray(pos + 4, pos + 4 + name.length).equals(nameBytes)) {
+      return hdr.readInt32LE(pos + 4 + name.length);
+    }
+    pos++;
+  }
+  return undefined;
+}
+
+function findDoubleInHeader(hdr: Buffer, name: string): number | undefined {
+  const nameBytes = Buffer.from(name);
+  const lenLE = Buffer.allocUnsafe(4);
+  lenLE.writeInt32LE(name.length, 0);
+  let pos = 0;
+  while (pos <= hdr.length - 4 - name.length - 8) {
+    if (hdr.subarray(pos, pos + 4).equals(lenLE) &&
+        hdr.subarray(pos + 4, pos + 4 + name.length).equals(nameBytes)) {
+      return hdr.readDoubleLE(pos + 4 + name.length);
+    }
+    pos++;
+  }
+  return undefined;
+}
 
 function parseFilterbankHeader(buf: Buffer): FilterbankHeader | null {
-  const HEADER_START = 'HEADER_START';
-  const HEADER_END = 'HEADER_END';
+  const startIdx = buf.indexOf('HEADER_START');
+  const endIdx   = buf.indexOf('HEADER_END');
+  if (startIdx === -1 || endIdx === -1) return null;
 
-  const startIdx = buf.indexOf(HEADER_START);
-  if (startIdx === -1) return null;
-  const endIdx = buf.indexOf(HEADER_END);
-  if (endIdx === -1) return null;
+  const headerSize = endIdx + 'HEADER_END'.length;
+  const hdr = buf.subarray(startIdx, endIdx);
 
-  const headerSize = endIdx + HEADER_END.length;
-  const header: Partial<FilterbankHeader> = { headerSize };
-
-  const intKeys = ['nchans', 'nbits', 'nifs', 'machine_id', 'telescope_id', 'data_type'];
-  const dblKeys = ['fch1', 'foff', 'tsamp', 'tstart', 'refdm', 'az_start', 'za_start', 'src_raj', 'src_dej'];
-  const strKeys = ['source_name', 'rawdatafile'];
-
-  let pos = startIdx + HEADER_START.length;
-
-  while (pos < endIdx - 4) {
-    if (pos + 4 > buf.length) break;
-    const keyLen = buf.readInt32LE(pos); pos += 4;
-    if (keyLen <= 0 || keyLen > 80 || pos + keyLen > buf.length) break;
-    const key = buf.subarray(pos, pos + keyLen).toString('ascii'); pos += keyLen;
-    if (key === HEADER_END) break;
-
-    if (intKeys.includes(key)) {
-      if (pos + 4 > buf.length) break;
-      const val = buf.readInt32LE(pos); pos += 4;
-      if (key === 'nchans') header.nchans = val;
-      if (key === 'nbits') header.nbits = val;
-    } else if (dblKeys.includes(key)) {
-      if (pos + 8 > buf.length) break;
-      const val = buf.readDoubleBE(pos); pos += 8;
-      if (key === 'fch1') header.fch1 = val;
-      if (key === 'foff') header.foff = val;
-      if (key === 'tsamp') header.tsamp = val;
-    } else if (strKeys.includes(key)) {
-      if (pos + 4 > buf.length) break;
-      const strLen = buf.readInt32LE(pos); pos += 4;
-      if (strLen > 0 && strLen < 256) pos += strLen;
+  // Cherche toutes les occurrences de nchans et garde la valeur sensée (1–65536)
+  const nchansCandidates: number[] = [];
+  const nameBytes = Buffer.from('nchans');
+  const lenLE = Buffer.allocUnsafe(4); lenLE.writeInt32LE(6, 0);
+  let p = 0;
+  while (p <= hdr.length - 4 - 6 - 4) {
+    if (hdr.subarray(p, p + 4).equals(lenLE) &&
+        hdr.subarray(p + 4, p + 10).equals(nameBytes)) {
+      nchansCandidates.push(hdr.readInt32LE(p + 10));
     }
+    p++;
   }
+  // Si pas de nchans valide (<= 65536), fallback 1 canal (bytes réels, format non-standard)
+  const nchans = nchansCandidates.find(v => v > 0 && v <= 65536) ?? 1;
 
-  if (!header.nchans || !header.nbits || !header.fch1) return null;
-  return header as FilterbankHeader;
+  const nbits  = findIntInHeader(hdr, 'nbits') ?? 8;
+  const fch1   = findDoubleInHeader(hdr, 'fch1');
+  const foff   = findDoubleInHeader(hdr, 'foff') ?? 0;
+  const tsamp  = findDoubleInHeader(hdr, 'tsamp') ?? 0;
+
+  if (!fch1) {
+    console.warn(`[BL] Header: fch1 non trouvé`);
+    return null;
+  }
+  console.log(`[BL] Header parsé: nchans=${nchans} nbits=${nbits} fch1=${fch1.toFixed(1)}MHz`);
+  return { nchans, nbits, fch1, foff, tsamp, headerSize };
 }
 
 // ─── Fetch d'un chunk depuis un fichier .fil ──────────────────────────────────
