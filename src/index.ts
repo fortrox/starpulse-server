@@ -113,9 +113,41 @@ app.get('/health', async (_req, res) => {
   }
 });
 
+// ─── Cache chunk GBT (pré-fetch en background) ───────────────────────────────
+// Le fetch GCS peut prendre 5-15s → on pré-charge le prochain chunk en avance
+// pour que /chunk réponde immédiatement avec de vraies données.
+
+type CachedChunk = Awaited<ReturnType<typeof fetchBLChunk>>;
+let chunkCache: CachedChunk = null;
+let cacheRefreshing = false;
+
+async function refreshCache() {
+  if (cacheRefreshing) return;
+  cacheRefreshing = true;
+  try {
+    const chunk = await fetchBLChunk();
+    if (chunk) { chunkCache = chunk; console.log(`[Cache] Chunk prêt: ${chunk.target} ${(chunk.frequencyHz/1e6).toFixed(1)}MHz`); }
+  } catch (e) {
+    console.warn('[Cache] Erreur refresh:', String(e));
+  } finally {
+    cacheRefreshing = false;
+  }
+}
+
+// Pré-chargement initial au démarrage du serveur
+setTimeout(refreshCache, 2000);
+
 // GET /chunk
 app.get('/chunk', async (_req, res) => {
+  if (chunkCache) {
+    const { chunkId, ...rest } = chunkCache;
+    chunkCache = null;            // consommé
+    refreshCache();               // prépare le suivant en arrière-plan
+    return res.json({ id: chunkId, ...rest, createdAt: Date.now() });
+  }
+  // Cache vide : on attend le fetch (première requête ou après erreur)
   const real = await fetchBLChunk();
+  refreshCache(); // lance le suivant
   if (real) {
     const { chunkId, ...rest } = real;
     return res.json({ id: chunkId, ...rest, createdAt: Date.now() });
