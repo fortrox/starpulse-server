@@ -102,7 +102,7 @@ app.get('/health', async (_req, res) => {
     ]);
     res.json({
       status: 'ok',
-      version: '3.0.0',
+      version: '3.1.0',
       contributors: parseInt(c.rows[0].count),
       resultsProcessed: parseInt(r.rows[0].count),
       anomaliesFound: parseInt(a.rows[0].count),
@@ -334,7 +334,7 @@ app.post('/referral', async (req, res) => {
 
 initDB().then(() => {
   app.listen(PORT, () => {
-    console.log(`★ StarPulse Server v3.0.0 running on port ${PORT}`);
+    console.log(`★ StarPulse Server v3.1.0 running on port ${PORT}`);
     console.log(`   Health : http://localhost:${PORT}/health`);
     console.log(`   Chunk  : http://localhost:${PORT}/chunk`);
     console.log(`   Board  : http://localhost:${PORT}/leaderboard`);
