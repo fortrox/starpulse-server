@@ -102,7 +102,7 @@ app.get('/health', async (_req, res) => {
     ]);
     res.json({
       status: 'ok',
-      version: '2.0.0',
+      version: '3.0.0',
       contributors: parseInt(c.rows[0].count),
       resultsProcessed: parseInt(r.rows[0].count),
       anomaliesFound: parseInt(a.rows[0].count),
@@ -116,8 +116,11 @@ app.get('/health', async (_req, res) => {
 // GET /chunk
 app.get('/chunk', async (_req, res) => {
   const real = await fetchBLChunk();
-  if (real) return res.json({ id: uuidv4(), ...real, createdAt: Date.now() });
-  return res.json({ ...generateChunk(), source: 'simulation' });
+  if (real) {
+    const { chunkId, ...rest } = real;
+    return res.json({ id: chunkId, ...rest, createdAt: Date.now() });
+  }
+  return res.json({ ...generateChunk(), source: 'simulation', target: null, telescope: null, observationUtc: null });
 });
 
 // POST /result
@@ -331,7 +334,7 @@ app.post('/referral', async (req, res) => {
 
 initDB().then(() => {
   app.listen(PORT, () => {
-    console.log(`★ StarPulse Server v2.0.0 running on port ${PORT}`);
+    console.log(`★ StarPulse Server v3.0.0 running on port ${PORT}`);
     console.log(`   Health : http://localhost:${PORT}/health`);
     console.log(`   Chunk  : http://localhost:${PORT}/chunk`);
     console.log(`   Board  : http://localhost:${PORT}/leaderboard`);
